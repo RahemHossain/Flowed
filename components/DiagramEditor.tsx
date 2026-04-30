@@ -19,6 +19,7 @@ import {
   type OnSelectionChangeParams,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
+import { useRouter } from 'next/navigation'
 
 import { nodeTypes } from './nodes'
 import { edgeTypes } from './edges'
@@ -28,6 +29,7 @@ import PropertiesPanel from './PropertiesPanel'
 import { getShapeDefinition } from '@/lib/shapeDefinitions'
 import { exportDiagram } from '@/lib/export'
 import type { NodeData, EdgeData, ExportFormat, PdfPageSize } from '@/lib/types'
+import { createClient } from '@/utils/supabase/client'
 
 const STORAGE_KEY = 'flowed-diagram'
 
@@ -36,16 +38,24 @@ function loadSaved(): { nodes: Node[]; edges: Edge[]; name: string } {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return { nodes: [], edges: [], name: 'Untitled Diagram' }
     const parsed = JSON.parse(raw)
-    // Strip fixed height from class nodes so they auto-size with content
     const nodes: Node[] = (parsed.nodes ?? []).map((n: Node) =>
       n.type === 'class' ? { ...n, style: { ...((n.style as object) ?? {}), height: undefined } } : n
     )
-    // Migrate any legacy edges that don't yet use the custom type
     const edges: Edge[] = (parsed.edges ?? []).map((e: Edge) => ({ ...e, type: 'diagram' }))
     return { nodes, edges, name: parsed.diagramName ?? 'Untitled Diagram' }
   } catch {
     return { nodes: [], edges: [], name: 'Untitled Diagram' }
   }
+}
+
+function normalizeNodes(nodes: Node[]): Node[] {
+  return nodes.map((n: Node) =>
+    n.type === 'class' ? { ...n, style: { ...((n.style as object) ?? {}), height: undefined } } : n
+  )
+}
+
+function normalizeEdges(edges: Edge[]): Edge[] {
+  return edges.map((e: Edge) => ({ ...e, type: 'diagram' }))
 }
 
 function generateId() {
@@ -70,13 +80,16 @@ interface HistoryEntry {
   edges: Edge[]
 }
 
-function DiagramEditorContent() {
+function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
   const reactFlow = useReactFlow()
+  const router = useRouter()
 
-  // Lazy-load saved state once on mount
-  const [saved] = useState(loadSaved)
+  const [saved] = useState(() =>
+    diagramId ? { nodes: [], edges: [], name: 'Untitled Diagram' } : loadSaved()
+  )
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>(saved.nodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(saved.edges)
+  const [diagramName, setDiagramName] = useState(saved.name)
 
   const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set())
   const [selectedEdgeIds, setSelectedEdgeIds] = useState<Set<string>>(new Set())
@@ -90,26 +103,130 @@ function DiagramEditorContent() {
     [edges, selectedEdgeIds],
   )
 
-  const [diagramName, setDiagramName] = useState(saved.name)
-
-  // Auto-save with 400ms debounce
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, edges, diagramName }))
-      } catch { /* storage full or unavailable */ }
-    }, 400)
-    return () => clearTimeout(timer)
-  }, [nodes, edges, diagramName])
   const [showGrid, setShowGrid] = useState(true)
   const [showMiniMap, setShowMiniMap] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [cloudLoading, setCloudLoading] = useState(!!diagramId)
+  const [cloudSaving, setCloudSaving] = useState(false)
+  const [notFound, setNotFound] = useState(false)
 
   const past = useRef<HistoryEntry[]>([])
   const future = useRef<HistoryEntry[]>([])
   const [canUndo, setCanUndo] = useState(false)
   const [canRedo, setCanRedo] = useState(false)
 
+  // Realtime refs
+  const channelRef = useRef<ReturnType<ReturnType<typeof createClient>['channel']> | null>(null)
+  const skipBroadcast = useRef(false)
+
+  // ── Cloud: load diagram ──────────────────────────────────────────────────
+  useEffect(() => {
+    if (!diagramId) return
+    const supabase = createClient()
+    supabase
+      .from('diagrams')
+      .select('*')
+      .eq('id', diagramId)
+      .single()
+      .then(({ data, error }) => {
+        if (error || !data) {
+          setNotFound(true)
+        } else {
+          setNodes(normalizeNodes(data.data?.nodes ?? []))
+          setEdges(normalizeEdges(data.data?.edges ?? []))
+          setDiagramName(data.name ?? 'Untitled Diagram')
+        }
+        setCloudLoading(false)
+      })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diagramId])
+
+  // ── Cloud: real-time channel ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!diagramId) return
+    const supabase = createClient()
+    const channel = supabase
+      .channel(`diagram-${diagramId}`, { config: { broadcast: { self: false } } })
+      .on('broadcast', { event: 'update' }, ({ payload }) => {
+        skipBroadcast.current = true
+        setNodes(normalizeNodes(payload.nodes ?? []))
+        setEdges(normalizeEdges(payload.edges ?? []))
+        if (payload.name) setDiagramName(payload.name)
+        // Reset skip flag after React processes the state updates
+        setTimeout(() => { skipBroadcast.current = false }, 300)
+      })
+      .subscribe()
+
+    channelRef.current = channel
+    return () => {
+      supabase.removeChannel(channel)
+      channelRef.current = null
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diagramId])
+
+  // ── Cloud: broadcast local changes to collaborators ──────────────────────
+  useEffect(() => {
+    if (!diagramId || !channelRef.current || cloudLoading) return
+    if (skipBroadcast.current) return
+
+    const timer = setTimeout(() => {
+      channelRef.current?.send({
+        type: 'broadcast',
+        event: 'update',
+        payload: { nodes, edges, name: diagramName },
+      })
+    }, 200)
+    return () => clearTimeout(timer)
+  }, [diagramId, nodes, edges, diagramName, cloudLoading])
+
+  // ── Cloud: save to database ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!diagramId || cloudLoading) return
+    const timer = setTimeout(async () => {
+      const supabase = createClient()
+      await supabase
+        .from('diagrams')
+        .update({ data: { nodes, edges }, name: diagramName, updated_at: new Date().toISOString() })
+        .eq('id', diagramId)
+    }, 1500)
+    return () => clearTimeout(timer)
+  }, [diagramId, nodes, edges, diagramName, cloudLoading])
+
+  // ── Local: auto-save to localStorage (home page only) ───────────────────
+  useEffect(() => {
+    if (diagramId) return
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, edges, diagramName }))
+      } catch { /* storage full */ }
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [diagramId, nodes, edges, diagramName])
+
+  // ── Save to cloud (from home page) ──────────────────────────────────────
+  const saveToCloud = useCallback(async () => {
+    setCloudSaving(true)
+    try {
+      const supabase = createClient()
+      const { data, error } = await supabase
+        .from('diagrams')
+        .insert({ name: diagramName, data: { nodes, edges } })
+        .select('id')
+        .single()
+      if (data && !error) {
+        router.push(`/diagram/${data.id}`)
+      }
+    } finally {
+      setCloudSaving(false)
+    }
+  }, [diagramName, nodes, edges, router])
+
+  const shareUrl = diagramId
+    ? `${typeof window !== 'undefined' ? window.location.origin : ''}/diagram/${diagramId}`
+    : undefined
+
+  // ── History ──────────────────────────────────────────────────────────────
   const snapshot = useCallback((currentNodes: Node[], currentEdges: Edge[]) => {
     past.current = [...past.current, { nodes: currentNodes, edges: currentEdges }].slice(-60)
     future.current = []
@@ -142,12 +259,7 @@ function DiagramEditorContent() {
   const makeEdge = useCallback(
     (connection: Connection, data: Partial<EdgeData> = {}): Edge => {
       const merged = { ...DEFAULT_EDGE, ...data } as EdgeData
-      return {
-        ...connection,
-        id: generateId(),
-        type: 'diagram',
-        data: merged,
-      } as Edge
+      return { ...connection, id: generateId(), type: 'diagram', data: merged } as Edge
     },
     [],
   )
@@ -169,17 +281,10 @@ function DiagramEditorContent() {
     (shapeType: string, position: { x: number; y: number }): Node => {
       const def = getShapeDefinition(shapeType)
       if (!def) throw new Error(`Unknown shape: ${shapeType}`)
-      // Class nodes auto-size based on content — no fixed height
       const style = def.nodeType === 'class'
         ? { width: def.defaultWidth }
         : { width: def.defaultWidth, height: def.defaultHeight }
-      return {
-        id: generateId(),
-        type: def.nodeType,
-        position,
-        style,
-        data: { ...def.defaultData },
-      }
+      return { id: generateId(), type: def.nodeType, position, style, data: { ...def.defaultData } }
     },
     [],
   )
@@ -229,16 +334,12 @@ function DiagramEditorContent() {
   }, [nodes, edges, snapshot])
 
   const onNodesDelete = useCallback(
-    (deleted: Node[]) => {
-      if (deleted.length > 0) snapshot(nodes, edges)
-    },
+    (deleted: Node[]) => { if (deleted.length > 0) snapshot(nodes, edges) },
     [nodes, edges, snapshot],
   )
 
   const onEdgesDelete = useCallback(
-    (deleted: Edge[]) => {
-      if (deleted.length > 0) snapshot(nodes, edges)
-    },
+    (deleted: Edge[]) => { if (deleted.length > 0) snapshot(nodes, edges) },
     [nodes, edges, snapshot],
   )
 
@@ -246,10 +347,7 @@ function DiagramEditorContent() {
     (patch: Record<string, unknown>) => {
       snapshot(nodes, edges)
       setNodes((nds) =>
-        nds.map((n) => {
-          if (!selectedNodeIds.has(n.id)) return n
-          return { ...n, data: { ...n.data, ...patch } }
-        }),
+        nds.map((n) => selectedNodeIds.has(n.id) ? { ...n, data: { ...n.data, ...patch } } : n)
       )
     },
     [nodes, edges, snapshot, selectedNodeIds, setNodes],
@@ -262,8 +360,7 @@ function DiagramEditorContent() {
         eds.map((e): Edge => {
           if (e.id !== id) return e
           const prev = (e.data ?? {}) as EdgeData
-          const merged: EdgeData = { ...DEFAULT_EDGE, ...prev, ...patch } as EdgeData
-          return { ...e, type: 'diagram', data: merged }
+          return { ...e, type: 'diagram', data: { ...DEFAULT_EDGE, ...prev, ...patch } as EdgeData }
         }),
       )
     },
@@ -293,6 +390,22 @@ function DiagramEditorContent() {
     [undo, redo],
   )
 
+  if (notFound) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh', gap: 12, color: '#64748b' }}>
+        <div style={{ fontSize: 18, fontWeight: 600, color: '#0f172a' }}>Diagram not found</div>
+        <div style={{ fontSize: 14 }}>This link may be invalid or the diagram was deleted.</div>
+        <button
+          onClick={() => router.push('/')}
+          type="button"
+          style={{ marginTop: 8, padding: '8px 20px', background: '#4f46e5', color: '#fff', border: 'none', borderRadius: 8, cursor: 'pointer', fontSize: 14, fontWeight: 600 }}
+        >
+          Back to home
+        </button>
+      </div>
+    )
+  }
+
   return (
     <div
       style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#f8fafc' }}
@@ -313,6 +426,9 @@ function DiagramEditorContent() {
         onToggleMiniMap={() => setShowMiniMap((v) => !v)}
         onExport={handleExport}
         exporting={exporting}
+        shareUrl={shareUrl}
+        onSaveToCloud={diagramId ? undefined : saveToCloud}
+        cloudSaving={cloudSaving}
       />
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
@@ -355,21 +471,28 @@ function DiagramEditorContent() {
               />
             )}
 
-            {nodes.length === 0 && (
+            {nodes.length === 0 && !cloudLoading && (
               <div
                 style={{
-                  position: 'absolute',
-                  top: '50%',
-                  left: '50%',
-                  transform: 'translate(-50%, -50%)',
-                  textAlign: 'center',
-                  pointerEvents: 'none',
-                  color: '#94a3b8',
-                  userSelect: 'none',
+                  position: 'absolute', top: '50%', left: '50%',
+                  transform: 'translate(-50%, -50%)', textAlign: 'center',
+                  pointerEvents: 'none', color: '#94a3b8', userSelect: 'none',
                 }}
               >
                 <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 6 }}>Your canvas is empty</div>
                 <div style={{ fontSize: 13 }}>Drag shapes from the left panel, then hover a shape to see connection handles</div>
+              </div>
+            )}
+
+            {cloudLoading && (
+              <div
+                style={{
+                  position: 'absolute', top: '50%', left: '50%',
+                  transform: 'translate(-50%, -50%)', color: '#94a3b8', fontSize: 14,
+                  pointerEvents: 'none',
+                }}
+              >
+                Loading diagram...
               </div>
             )}
           </ReactFlow>
@@ -386,10 +509,10 @@ function DiagramEditorContent() {
   )
 }
 
-export default function DiagramEditor() {
+export default function DiagramEditor({ diagramId }: { diagramId?: string }) {
   return (
     <ReactFlowProvider>
-      <DiagramEditorContent />
+      <DiagramEditorContent diagramId={diagramId} />
     </ReactFlowProvider>
   )
 }

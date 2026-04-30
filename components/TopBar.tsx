@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useRef } from 'react'
-import { Undo2, Redo2, Download, Grid3x3, Map, ChevronDown, ZoomIn } from 'lucide-react'
+import { Undo2, Redo2, Download, Grid3x3, Map, ChevronDown, ZoomIn, Link2, Share2, Check } from 'lucide-react'
 import type { ExportFormat, PdfPageSize } from '@/lib/types'
 
 interface TopBarProps {
@@ -18,6 +18,10 @@ interface TopBarProps {
   onToggleMiniMap: () => void
   onExport: (format: ExportFormat, pageSize: PdfPageSize) => void
   exporting: boolean
+  // cloud / sharing
+  shareUrl?: string
+  onSaveToCloud?: () => void
+  cloudSaving?: boolean
 }
 
 export default function TopBar({
@@ -34,16 +38,28 @@ export default function TopBar({
   onToggleMiniMap,
   onExport,
   exporting,
+  shareUrl,
+  onSaveToCloud,
+  cloudSaving,
 }: TopBarProps) {
   const [exportOpen, setExportOpen] = useState(false)
   const [editingName, setEditingName] = useState(false)
   const [nameDraft, setNameDraft] = useState(diagramName)
+  const [copied, setCopied] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
 
   const commitName = () => {
     setEditingName(false)
     onDiagramNameChange(nameDraft.trim() || 'Untitled Diagram')
+  }
+
+  const handleCopyLink = () => {
+    if (!shareUrl) return
+    navigator.clipboard.writeText(shareUrl).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
   }
 
   const btn = (
@@ -54,6 +70,7 @@ export default function TopBar({
     active?: boolean
   ) => (
     <button
+      type="button"
       onClick={onClick}
       disabled={disabled}
       title={label}
@@ -129,6 +146,7 @@ export default function TopBar({
           />
         ) : (
           <button
+            type="button"
             onClick={() => {
               setNameDraft(diagramName)
               setEditingName(true)
@@ -168,9 +186,72 @@ export default function TopBar({
 
         <div style={{ width: 1, height: 20, background: '#e2e8f0', margin: '0 4px' }} />
 
+        {/* Share / Copy link */}
+        {shareUrl ? (
+          <button
+            type="button"
+            onClick={handleCopyLink}
+            title="Copy shareable link"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '6px 12px',
+              background: copied ? '#f0fdf4' : '#f1f5f9',
+              border: `1px solid ${copied ? '#86efac' : '#e2e8f0'}`,
+              borderRadius: 7,
+              cursor: 'pointer',
+              color: copied ? '#16a34a' : '#475569',
+              fontSize: 13,
+              fontWeight: 600,
+              transition: 'all 0.15s',
+            }}
+          >
+            {copied ? <Check size={14} /> : <Link2 size={14} />}
+            {copied ? 'Copied!' : 'Copy link'}
+          </button>
+        ) : onSaveToCloud ? (
+          <button
+            type="button"
+            onClick={onSaveToCloud}
+            disabled={cloudSaving}
+            title="Save to cloud and get a shareable link"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '6px 12px',
+              background: '#f8faff',
+              border: '1px solid #c7d2fe',
+              borderRadius: 7,
+              cursor: cloudSaving ? 'wait' : 'pointer',
+              color: '#4f46e5',
+              fontSize: 13,
+              fontWeight: 600,
+              transition: 'all 0.15s',
+            }}
+            onMouseEnter={(e) => {
+              if (!cloudSaving) {
+                (e.currentTarget as HTMLButtonElement).style.background = '#ede9fe'
+                ;(e.currentTarget as HTMLButtonElement).style.borderColor = '#a5b4fc'
+              }
+            }}
+            onMouseLeave={(e) => {
+              ;(e.currentTarget as HTMLButtonElement).style.background = '#f8faff'
+              ;(e.currentTarget as HTMLButtonElement).style.borderColor = '#c7d2fe'
+            }}
+          >
+            <Share2 size={14} />
+            {cloudSaving ? 'Saving...' : 'Share'}
+          </button>
+        ) : null}
+
+        <div style={{ width: 1, height: 20, background: '#e2e8f0', margin: '0 4px' }} />
+
         {/* Export button */}
         <div style={{ position: 'relative' }} ref={dropdownRef}>
           <button
+            type="button"
             onClick={() => setExportOpen((o) => !o)}
             disabled={exporting}
             style={{
@@ -227,22 +308,10 @@ export default function TopBar({
                   { label: 'JPEG', format: 'jpeg' as ExportFormat, pageSize: 'fit' as PdfPageSize },
                 ].map((opt) => (
                   <button
+                    type="button"
                     key={opt.label}
-                    onClick={() => {
-                      setExportOpen(false)
-                      onExport(opt.format, opt.pageSize)
-                    }}
-                    style={{
-                      display: 'block',
-                      width: '100%',
-                      padding: '9px 16px',
-                      background: 'none',
-                      border: 'none',
-                      textAlign: 'left',
-                      cursor: 'pointer',
-                      color: '#1e293b',
-                      fontSize: 13,
-                    }}
+                    onClick={() => { setExportOpen(false); onExport(opt.format, opt.pageSize) }}
+                    style={{ display: 'block', width: '100%', padding: '9px 16px', background: 'none', border: 'none', textAlign: 'left', cursor: 'pointer', color: '#1e293b', fontSize: 13 }}
                     onMouseEnter={(e) => ((e.currentTarget as HTMLButtonElement).style.background = '#f8fafc')}
                     onMouseLeave={(e) => ((e.currentTarget as HTMLButtonElement).style.background = 'none')}
                   >
@@ -263,22 +332,10 @@ export default function TopBar({
                   { label: 'PDF Letter Landscape', pageSize: 'letter-landscape' as PdfPageSize },
                 ].map((opt) => (
                   <button
+                    type="button"
                     key={opt.pageSize}
-                    onClick={() => {
-                      setExportOpen(false)
-                      onExport('pdf', opt.pageSize)
-                    }}
-                    style={{
-                      display: 'block',
-                      width: '100%',
-                      padding: '9px 16px',
-                      background: 'none',
-                      border: 'none',
-                      textAlign: 'left',
-                      cursor: 'pointer',
-                      color: '#1e293b',
-                      fontSize: 13,
-                    }}
+                    onClick={() => { setExportOpen(false); onExport('pdf', opt.pageSize) }}
+                    style={{ display: 'block', width: '100%', padding: '9px 16px', background: 'none', border: 'none', textAlign: 'left', cursor: 'pointer', color: '#1e293b', fontSize: 13 }}
                     onMouseEnter={(e) => ((e.currentTarget as HTMLButtonElement).style.background = '#f8fafc')}
                     onMouseLeave={(e) => ((e.currentTarget as HTMLButtonElement).style.background = 'none')}
                   >
