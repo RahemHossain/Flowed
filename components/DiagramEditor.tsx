@@ -58,6 +58,14 @@ function normalizeEdges(edges: Edge[]): Edge[] {
   return edges.map((e: Edge) => ({ ...e, type: 'diagram' }))
 }
 
+// Strip transient React Flow UI state so collaborators don't inherit each other's selection/drag state
+function stripUIState(nodes: Node[], edges: Edge[]) {
+  return {
+    nodes: nodes.map(({ selected: _s, dragging: _d, ...n }) => n as Node),
+    edges: edges.map(({ selected: _s, ...e }) => e as Edge),
+  }
+}
+
 function generateId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
 }
@@ -171,10 +179,11 @@ function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
     if (skipBroadcast.current) return
 
     const timer = setTimeout(() => {
+      const clean = stripUIState(nodes, edges)
       channelRef.current?.send({
         type: 'broadcast',
         event: 'update',
-        payload: { nodes, edges, name: diagramName },
+        payload: { nodes: clean.nodes, edges: clean.edges, name: diagramName },
       })
     }, 200)
     return () => clearTimeout(timer)
@@ -185,9 +194,10 @@ function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
     if (!diagramId || cloudLoading) return
     const timer = setTimeout(async () => {
       const supabase = createClient()
+      const clean = stripUIState(nodes, edges)
       await supabase
         .from('diagrams')
-        .update({ data: { nodes, edges }, name: diagramName, updated_at: new Date().toISOString() })
+        .update({ data: { nodes: clean.nodes, edges: clean.edges }, name: diagramName, updated_at: new Date().toISOString() })
         .eq('id', diagramId)
     }, 1500)
     return () => clearTimeout(timer)
