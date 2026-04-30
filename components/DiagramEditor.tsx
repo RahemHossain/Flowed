@@ -11,6 +11,7 @@ import {
   useNodesState,
   useEdgesState,
   useReactFlow,
+  useViewport,
   ReactFlowProvider,
   ConnectionMode,
   type Node,
@@ -88,6 +89,41 @@ interface HistoryEntry {
   edges: Edge[]
 }
 
+// ── Cursor presence ──────────────────────────────────────────────────────────
+const CURSOR_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899']
+const CURSOR_NAMES = ['Fox', 'Bear', 'Wolf', 'Hawk', 'Lynx', 'Crow', 'Deer', 'Owl', 'Puma', 'Ibis']
+
+interface RemoteCursor { x: number; y: number; color: string; name: string }
+
+function RemoteCursors({ cursors }: { cursors: Map<string, RemoteCursor> }) {
+  const { x: vpX, y: vpY, zoom } = useViewport()
+  return (
+    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden', zIndex: 20 }}>
+      {Array.from(cursors.entries()).map(([id, c]) => {
+        const sx = c.x * zoom + vpX
+        const sy = c.y * zoom + vpY
+        return (
+          <div key={id} style={{ position: 'absolute', left: sx, top: sy, pointerEvents: 'none' }}>
+            <svg width="16" height="20" viewBox="0 0 16 20" style={{ display: 'block', filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.25))' }}>
+              <path d="M0 0L0 16L3.5 12L6 18.5L8.5 17.5L6 11L11 11Z" fill={c.color} stroke="#fff" strokeWidth="1.2" strokeLinejoin="round" />
+            </svg>
+            <div style={{
+              position: 'absolute', left: 14, top: 12,
+              background: c.color, color: '#fff',
+              fontSize: 10, fontWeight: 700, letterSpacing: '0.02em',
+              padding: '2px 6px', borderRadius: 4,
+              whiteSpace: 'nowrap',
+              boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
+            }}>
+              {c.name}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
   const reactFlow = useReactFlow()
   const router = useRouter()
@@ -127,6 +163,14 @@ function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
   const channelRef = useRef<ReturnType<ReturnType<typeof createClient>['channel']> | null>(null)
   const skipBroadcast = useRef(false)
 
+  // Cursor presence
+  const sessionId = useRef(Math.random().toString(36).slice(2, 8))
+  const sessionColor = useRef(CURSOR_COLORS[Math.floor(Math.random() * CURSOR_COLORS.length)])
+  const sessionName = useRef(CURSOR_NAMES[Math.floor(Math.random() * CURSOR_NAMES.length)])
+  const [remoteCursors, setRemoteCursors] = useState<Map<string, RemoteCursor>>(new Map())
+  const cursorTimeouts = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  const lastCursorSend = useRef(0)
+
   // ── Cloud: load diagram ──────────────────────────────────────────────────
   useEffect(() => {
     if (!diagramId) return
@@ -160,8 +204,23 @@ function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
         setNodes(normalizeNodes(payload.nodes ?? []))
         setEdges(normalizeEdges(payload.edges ?? []))
         if (payload.name) setDiagramName(payload.name)
-        // Reset skip flag after React processes the state updates
         setTimeout(() => { skipBroadcast.current = false }, 300)
+      })
+      .on('broadcast', { event: 'cursor' }, ({ payload }) => {
+        const sid: string = payload.sessionId
+        // Clear the auto-remove timeout for this user and reset it
+        const existing = cursorTimeouts.current.get(sid)
+        if (existing) clearTimeout(existing)
+        setRemoteCursors(prev => {
+          const next = new Map(prev)
+          if (payload.gone) { next.delete(sid); return next }
+          next.set(sid, { x: payload.x, y: payload.y, color: payload.color, name: payload.name })
+          return next
+        })
+        const t = setTimeout(() => {
+          setRemoteCursors(prev => { const next = new Map(prev); next.delete(sid); return next })
+        }, 5000)
+        cursorTimeouts.current.set(sid, t)
       })
       .subscribe()
 
@@ -391,6 +450,29 @@ function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
     [reactFlow, diagramName],
   )
 
+  const onCanvasMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!diagramId || !channelRef.current) return
+      const now = Date.now()
+      if (now - lastCursorSend.current < 50) return // throttle to ~20fps
+      lastCursorSend.current = now
+      const pos = reactFlow.screenToFlowPosition({ x: e.clientX, y: e.clientY })
+      channelRef.current.send({
+        type: 'broadcast', event: 'cursor',
+        payload: { sessionId: sessionId.current, x: pos.x, y: pos.y, color: sessionColor.current, name: sessionName.current },
+      })
+    },
+    [diagramId, reactFlow],
+  )
+
+  const onCanvasMouseLeave = useCallback(() => {
+    if (!diagramId || !channelRef.current) return
+    channelRef.current.send({
+      type: 'broadcast', event: 'cursor',
+      payload: { sessionId: sessionId.current, gone: true },
+    })
+  }, [diagramId])
+
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       const meta = e.metaKey || e.ctrlKey
@@ -444,7 +526,7 @@ function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         <Toolbar onAddShape={addShape} />
 
-        <div style={{ flex: 1, position: 'relative' }}>
+        <div style={{ flex: 1, position: 'relative' }} onMouseMove={onCanvasMouseMove} onMouseLeave={onCanvasMouseLeave}>
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -505,6 +587,8 @@ function DiagramEditorContent({ diagramId }: { diagramId?: string }) {
                 Loading diagram...
               </div>
             )}
+
+            <RemoteCursors cursors={remoteCursors} />
           </ReactFlow>
         </div>
 
